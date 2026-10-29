@@ -1,0 +1,28 @@
+configuration:
+  username:
+    name: Alula username
+    description: Email or username for the Alula Security app (or your dealer's branded version of it).
+  password:
+    name: Alula password
+    description: Password for that Alula account.
+  code:
+    name: Panel user code
+    description: 4-digit DSC user code used to arm and disarm. Leave blank to refuse arm/disarm commands until set. Bypass does not need a code.
+  poll_interval:
+    name: Poll interval (seconds)
+    description: How often to re-read panel state as a fallback. Live updates arrive over the Alula WebSocket.
+  level_home:
+    name: Arm Home / Stay level
+    description: Alula armingLevelValue for Stay/Home (0 = auto from the panel's labels; typically 2).
+  level_away:
+    name: Arm Away level
+    description: Alula armingLevelValue for Away (0 = auto; typically 4 on DSC via BAT-Connect).
+  level_night:
+    name: Arm Night level
+    description: Alula armingLevelValue for Night (0 = hide Night; many DSC panels have no Night level).
+  device_name:
+    name: Device name
+    description: Friendly name shown in Home Assistant for the alarm panel device.
+  log_level:
+    name: Log level
+    description: Verbosity of the add-on logs.

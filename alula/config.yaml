@@ -1,0 +1,37 @@
+name: Alula BAT-Connect
+version: "0.1.2"
+slug: alula
+description: >
+  Bridge an Alula BAT-Connect (DSC PowerSeries) alarm panel to Home Assistant
+  over MQTT. Uses the same Alula cloud API as the Alula Security mobile app.
+url: https://github.com/jb9485/ha-alula-addon
+arch:
+  - aarch64
+  - amd64
+init: false
+startup: application
+boot: auto
+services:
+  - mqtt:need
+options:
+  username: ""
+  password: ""
+  code: ""
+  poll_interval: 30
+  level_home: 0
+  level_away: 0
+  level_night: 0
+  device_name: Alula Alarm
+  log_level: info
+schema:
+  username: str
+  password: password
+  code: password
+  poll_interval: int(10,300)
+  level_home: int(0,8)
+  level_away: int(0,8)
+  level_night: int(0,8)
+  device_name: str
+  log_level: list(debug|info|warning|error)
+map:
+  - ssl:ro
