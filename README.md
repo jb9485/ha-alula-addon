@@ -64,5 +64,5 @@ is hard-coded.
 
 ## Disclaimer
 
-Use at your own risk on your own account and equipment. Keep the official app
+Use at your own risk on your own account and equipment. This is not a replacement for the Alula app. Keep the official app
 installed. Do not rely solely on this add-on for life-safety.
