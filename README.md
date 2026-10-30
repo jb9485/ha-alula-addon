@@ -1,5 +1,9 @@
 # Alula BAT-Connect Home Assistant add-on
 
+I wanted an HA add on that I could use to make sure the alarm was set if I left home and forgot.
+There was no existing add on, so I built one. Set up an automation to check the presence of users
+in the house.  If empty check the arm state of alarm, and arm away if no one is home.
+
 Bridge an [Alula](https://www.alula.com/) BAT-Connect (DSC PowerSeries, Honeywell
 Vista, etc.) alarm panel into Home Assistant over MQTT.
 
