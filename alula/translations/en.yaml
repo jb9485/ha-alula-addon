@@ -20,6 +20,18 @@ configuration:
   level_night:
     name: Arm Night level
     description: Alula armingLevelValue for Night (0 = hide Night; many DSC panels have no Night level).
+  stay_instant:
+    name: Instant Stay (no entry delay)
+    description: When on, every Arm Home / Stay arms with no entry delay, so opening an entry door sets off the alarm immediately.
+  night_instant:
+    name: Arm Night = Stay instant
+    description: When the panel has no Night level, show Arm Night in Home Assistant and use it to arm Stay with no entry delay. Plain Arm Home keeps the normal entry delay unless Instant Stay is on.
+  prompt_timeout:
+    name: Bypass prompt timeout (seconds)
+    description: How long a manual arm with open zones waits for "Bypass open zones and arm" or "Cancel arm" before it is dropped.
+  notify_services:
+    name: Phone notify services
+    description: Optional. Comma-separated notify services (for example mobile_app_my_phone) that get an actionable "Bypass and arm / Cancel" notification when a manual arm finds open zones.
   device_name:
     name: Device name
     description: Friendly name shown in Home Assistant for the alarm panel device.

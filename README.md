@@ -28,12 +28,15 @@ go through `changeArmingLevelUsingCode`; zone bypass goes through
 
 | Entity | Purpose |
 |---|---|
-| `alarm_control_panel.*` | Arm Home / Away (/ Night if the panel has it) and Disarm. The stored code is applied by the add-on so HA does not prompt. |
+| `alarm_control_panel.*` | Arm Home / Away / Night and Disarm. Manual arming with open zones asks before bypassing (see DOCS). The stored code is applied by the add-on so HA does not prompt. |
 | `binary_sensor.*` (one per zone) | Open / closed for every named zone. |
 | Status sensors | Ready to arm, Alarm, Tamper, **AC failure**, Low battery, Remote arming enabled (informational only — does **not** block commands). |
 | `button.*_bypass_open_zones` | Bypass every currently open, bypassable zone (refused while armed). |
 | `button.*_unbypass_all` | Clear every bypass (DSC also clears bypasses on the next disarm). |
 | `sensor.*_bypassed_zones` | Human-readable list of currently bypassed zones. |
+| `sensor.*_arm_prompt` | `waiting` while a manual arm is held because zones are open; `idle` otherwise. |
+| `button.*_bypass_open_zones_and_arm` / `button.*_cancel_arm` | Answer the arm prompt. |
+| `button.*_arm_stay_auto_bypass` / `button.*_arm_away_auto_bypass` | For automations: bypass open zones and arm, no prompt. |
 
 ## Configuration
 
@@ -46,6 +49,10 @@ is hard-coded.
 | `code` | 4-digit DSC user code (optional; required to arm/disarm) |
 | `poll_interval` | Fallback poll seconds (default 30; live updates are push) |
 | `level_home` / `level_away` / `level_night` | Override the panel's arming-level numbers (`0` = auto) |
+| `stay_instant` | Arm Home / Stay always with no entry delay (default off) |
+| `night_instant` | Arm Night = Stay with no entry delay, when the panel has no Night level (default on) |
+| `prompt_timeout` | Seconds a manual arm with open zones waits for an answer (default 60) |
+| `notify_services` | Optional comma-separated `mobile_app_*` notify services for the actionable prompt |
 | `device_name` | Friendly name for the HA device |
 | `log_level` | `debug` / `info` / `warning` / `error` |
 

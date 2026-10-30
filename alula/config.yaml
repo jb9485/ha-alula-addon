@@ -1,5 +1,5 @@
 name: Alula BAT-Connect
-version: "0.1.2"
+version: "0.2.0"
 slug: alula
 description: >
   Bridge an Alula BAT-Connect (DSC PowerSeries) alarm panel to Home Assistant
@@ -11,6 +11,7 @@ arch:
 init: false
 startup: application
 boot: auto
+homeassistant_api: true
 services:
   - mqtt:need
 options:
@@ -21,6 +22,10 @@ options:
   level_home: 0
   level_away: 0
   level_night: 0
+  stay_instant: false
+  night_instant: true
+  prompt_timeout: 60
+  notify_services: ""
   device_name: Alula Alarm
   log_level: info
 schema:
@@ -31,6 +36,10 @@ schema:
   level_home: int(0,8)
   level_away: int(0,8)
   level_night: int(0,8)
+  stay_instant: bool
+  night_instant: bool
+  prompt_timeout: int(15,300)
+  notify_services: str?
   device_name: str
   log_level: list(debug|info|warning|error)
 map:

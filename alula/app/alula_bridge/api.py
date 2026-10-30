@@ -200,6 +200,8 @@ class PanelState:
     ready_to_arm: Optional[bool] = None
     in_exit_delay: Optional[bool] = None
     in_entry_delay: Optional[bool] = None
+    # panelStatus.armingWithNoDelay: armed with no entry delay ("instant")
+    arming_no_delay: Optional[bool] = None
     alarm: Optional[bool] = None
     alarm_type: Optional[str] = None
     open_zones: Optional[int] = None
@@ -262,7 +264,7 @@ class PanelState:
         if "arming_level_names" in attrs and isinstance(attrs["arming_level_names"], dict):
             self.arming_level_names = attrs["arming_level_names"]
         for src in (
-            "ready_to_arm", "in_exit_delay", "in_entry_delay", "alarm",
+            "ready_to_arm", "in_exit_delay", "in_entry_delay", "arming_no_delay", "alarm",
             "low_battery", "ac_failure", "tamper", "cs_comm_fail",
             "server_comm_fail", "siren_trouble", "fire_trouble",
         ):
@@ -783,6 +785,7 @@ class AlulaClient:
         "ready_to_arm": "ready_to_arm", "readyToArm": "ready_to_arm",
         "in_exit_delay": "in_exit_delay", "inExitDelay": "in_exit_delay",
         "in_entry_delay": "in_entry_delay", "inEntryDelay": "in_entry_delay",
+        "armingWithNoDelay": "arming_no_delay", "arming_no_delay": "arming_no_delay",
         "alarm": "alarm", "alarm_type": "alarm_type", "alarmType": "alarm_type",
         "open_zones": "open_zones", "openZones": "open_zones",
         "bypassed_zones": "bypassed_zones", "bypassedZones": "bypassed_zones",

@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.2.0
+
+- Manual arming with open zones no longer arms blindly. It holds the request,
+  publishes `sensor.*_arm_prompt` (`waiting` with the open zones), creates a
+  Home Assistant notification, and optionally sends an actionable phone
+  notification. Answer with **Bypass open zones and arm** or **Cancel arm**.
+  The request expires after `prompt_timeout` seconds (default 60).
+- Automation path: **Arm stay (auto-bypass)** / **Arm away (auto-bypass)**
+  buttons, or `code: BYPASS` on the alarm entity, bypass open zones and arm with
+  no prompt.
+- Instant Stay: new `stay_instant` option (no entry delay on every Stay arm) and
+  `night_instant` option (Arm Night = Stay with no entry delay, on by default for
+  panels without a Night level). Uses the panel's `noEntryDelay` flag; the
+  panel's `armingWithNoDelay` status is shown as `entry_delay_disabled`.
+- New options: `prompt_timeout`, `notify_services`. The add-on now requests
+  `homeassistant_api` for its prompt notifications.
+
 ## 0.1.2
 
 - Fix: actually run the MQTT listen loop so arm/disarm/bypass commands from
