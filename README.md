@@ -4,6 +4,8 @@ I wanted an HA add on that I could use to make sure the alarm was set if I left 
 There was no existing add on, so I built one. Set up an automation to check the presence of users
 in the house.  If empty check the arm state of alarm, and arm away if no one is home.
 
+This has only been tested on DSC Power series panels, it may need some tweaking for other brands.
+
 Bridge an [Alula](https://www.alula.com/) BAT-Connect (DSC PowerSeries, Honeywell
 Vista, etc.) alarm panel into Home Assistant over MQTT.
 
