@@ -43,7 +43,9 @@ with no special code). If any zone is open and not bypassed, the add-on does
   `cannot_bypass`, `expires_at`, `message`),
 - creates a Home Assistant notification listing the open zones,
 - sends an actionable phone notification (**Bypass and arm** / **Cancel**) to
-  every service in `notify_services`, if you set any.
+  every service in `notify_services`, if you set any. Each prompt's buttons carry
+  a one-time id, so an old notification or a forged event cannot arm. Service
+  names may only use lowercase letters, digits and `_`.
 
 Answer with **Bypass open zones and arm** (`button.*_bypass_open_zones_and_arm`)
 or **Cancel arm** (`button.*_cancel_arm`), or with the phone notification's
@@ -95,11 +97,84 @@ door zones trip immediately instead of starting the entry delay.
 - Automations can add instant to any arm with `code: INSTANT` or
   `code: BYPASS_INSTANT`.
 
+## Codes: arm without a code, disarm with one
+
+- **Arming** never asks for a code. The add-on sends the saved `code` to the panel.
+- **Disarming** asks for the 4-digit code in Home Assistant (more-info dialog,
+  alarm panel card, tile keypad). The add-on compares it with the saved `code`
+  and sends nothing to the panel if it does not match. Five wrong codes within
+  10 minutes pause disarming from Home Assistant for 2 minutes (the keypad and
+  the Alula app still work). A rejected code raises an "Alarm" notification in
+  Home Assistant; codes are never logged or published.
+- With no saved `code`, arming is refused and a 4-digit disarm code is passed to
+  the panel, which checks it.
+
+### Disarming from an automation (arrival)
+
+Don't put the code in an automation. Publish to the add-on's automation-only
+disarm topic instead:
+
+```yaml
+- action: mqtt.publish
+  data:
+    topic: alula/<device id>/alarm/auto_disarm
+    payload: DISARM
+```
+
+The add-on then disarms with its saved code, but **only while the alarm is armed
+Away**; it ignores this topic in Stay / Night (someone is inside) or when
+disarmed. Protect the topic with a broker ACL so that only Home Assistant
+(`homeassistant`) and add-ons (`addons`) may publish to `alula/#`; see
+"Securing the broker" below. The device id is in the topics shown on
+**Settings → Devices → Alula Alarm → MQTT info**.
+
+## Securing the broker
+
+Anyone who can publish to `alula/#` can arm, bypass and (via `auto_disarm`, Away
+only) disarm. With the Mosquitto add-on, every Home Assistant user can log in to
+the broker by default, so add an ACL (Mosquitto **customize** → `/share/mosquitto`):
+
+```text
+# /share/mosquitto/acl.conf
+acl_file /share/mosquitto/accesscontrollist
+```
+
+```text
+# /share/mosquitto/accesscontrollist
+user homeassistant
+topic readwrite #
+
+user addons
+topic readwrite #
+
+# every other broker user: deny the alarm, then allow what that client needs
+user my_other_mqtt_user
+topic deny alula/#
+topic readwrite my_device_topics/#
+```
+
+Note that `addons` is shared by every add-on that uses the Supervisor's MQTT
+service.
+
+## Reliability
+
+- The add-on sets an MQTT last-will, so if it dies the broker marks every
+  entity unavailable instead of HA showing stale alarm state.
+- It reconnects to the broker on its own (1 s backoff, doubling to 60 s) and
+  ignores retained command messages.
+- An unexpected internal error exits the add-on with a non-zero status; turn on
+  **Watchdog** on the add-on's Info tab so the Supervisor restarts it.
+- Commands run independently, and **Disarm always goes first**: it cancels an
+  arm that is still waiting on the cloud and any open bypass prompt.
+- Alula logins back off from 30 s, doubling to 30 min, and obey `Retry-After`.
+  If Alula rejects the username or password, the add-on stops logging in
+  (also across restarts), raises one notification, and waits until you change
+  the username or password.
+
 ## Options
 
 See the Configuration tab. `code` is stored by the Supervisor as a password
-field and is never logged. Leave it blank until you are ready; arm / disarm will
-then fail with a clear error, while zone status still works.
+field and is never logged or published.
 
 Level overrides (`level_home` / `level_away` / `level_night`) map HA arm modes
 to the panel's `armingLevelValue`. Leave them at `0` to use the panel's own
@@ -107,7 +182,8 @@ labels (`armingLevelName`). On a typical DSC via BAT-Connect that is Stay=2 and
 Away=4, with no Night level.
 
 `homeassistant_api` is enabled only so the add-on can create and dismiss its own
-arm-prompt notifications and hear the phone notification's button presses.
+notifications and hear the phone notification's button presses. Error
+notifications are generic; details go to the add-on log.
 
 ## Support
 

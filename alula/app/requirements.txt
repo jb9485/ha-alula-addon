@@ -1,2 +1,2 @@
-aiohttp>=3.9,<4
-aiomqtt>=2.0,<3
+aiohttp>=3.12.14,<4
+aiomqtt>=2.3,<3

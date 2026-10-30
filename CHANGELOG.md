@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.3.0
+
+Security and reliability release.
+
+- **Disarm now needs the panel code; arming still does not.** The alarm entity
+  uses `code: REMOTE_CODE` with `code_arm_required: false` and
+  `code_disarm_required: true`, so HA's keypad appears on disarm only. The add-on
+  checks the entered code against the saved code (constant-time) before sending
+  anything; 5 wrong codes in 10 min pause HA disarm for 2 min.
+- New automation-only `alula/<device id>/alarm/auto_disarm` topic (payload
+  `DISARM`): disarms with the saved code, only while armed Away. Lock it down
+  with a broker ACL (see DOCS).
+- MQTT last-will (`offline`), automatic broker reconnect with backoff, retained
+  commands ignored, non-zero exit on an unexpected error so the Supervisor
+  watchdog can restart the add-on.
+- Commands run as separate tasks; DISARM cancels a pending arm or prompt and
+  never waits behind one.
+- Alula login backoff (30 s doubling to 30 min, honours `Retry-After`). A
+  rejected username/password stops all login attempts, across restarts, until
+  the options change, with one notification.
+- Phone prompt actions carry a per-prompt one-time id and the tag is checked;
+  two simultaneous confirmations can no longer both act.
+- `notify_services` names are validated (`^[a-z0-9_]+$`).
+- Error notifications no longer include raw cloud responses; token and REST
+  errors carry only the HTTP status and OAuth error code.
+- Removed the unused `ssl` folder mapping. Tightened dependency floors
+  (`aiohttp>=3.12.14`, `aiomqtt>=2.3`).
+
 ## 0.2.0
 
 - Manual arming with open zones no longer arms blindly. It holds the request,

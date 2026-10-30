@@ -9,9 +9,14 @@ arm/disarm this account regardless of that flag.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import hashlib
+import hmac
 import json
 import logging
 import os
+import re
+import secrets
 import signal
 import time
 from dataclasses import dataclass
@@ -25,12 +30,13 @@ from .api import (
     LEVEL_STAY,
     AlulaAuthError,
     AlulaClient,
+    AlulaCredentialsRejected,
     AlulaError,
     PanelState,
     Zone,
 )
 from .ha_core import HaCore
-from .mqtt_client import Mqtt
+from .mqtt_client import Mqtt, MqttError
 from .zones import device_class, is_placeholder, slugify
 
 _LOGGER = logging.getLogger(__name__)
@@ -44,6 +50,22 @@ ACTION_CANCEL = "ALULA_CANCEL_ARM"
 CODE_TOKENS_BYPASS = {"BYPASS", "AUTO", "AUTO_BYPASS", "AUTOBYPASS"}
 CODE_TOKENS_INSTANT = {"INSTANT", "NO_DELAY", "NODELAY"}
 MODE_LABEL = {"home": "Stay", "away": "Away", "night": "Night (stay, instant)"}
+NOTIFY_NAME = re.compile(r"^[a-z0-9_]+$")
+AUTH_BLOCK_PATH = os.environ.get("ALULA_AUTH_BLOCK", "/data/auth_block.json")
+# Wrong disarm codes: this many within the window locks HA-side disarm for a while.
+BAD_CODE_LIMIT = 5
+BAD_CODE_WINDOW = 600.0
+BAD_CODE_LOCKOUT = 120.0
+STARTUP_BACKOFF_MAX = 1800.0
+
+
+class UserError(AlulaError):
+    """An error whose text is safe and useful to show in a notification."""
+
+
+def _valid_pin(code: str) -> bool:
+    # DSC PowerSeries user codes are 4 digits.
+    return bool(code) and code.isdigit() and len(code) == 4
 
 
 @dataclass
@@ -89,9 +111,20 @@ class Options:
             svc = part.strip()
             if svc.startswith("notify."):
                 svc = svc[len("notify."):]
-            if svc:
-                out.append(svc)
+            if not svc:
+                continue
+            if not NOTIFY_NAME.match(svc):
+                _LOGGER.warning("Ignoring invalid notify service name %r "
+                                "(allowed: lowercase letters, digits, _)", svc[:64])
+                continue
+            out.append(svc)
         return out
+
+    def credentials_fingerprint(self) -> str:
+        # Salted hash so the block file never holds the credentials themselves.
+        return hashlib.sha256(
+            ("alula-block\0" + self.username + "\0" + self.password).encode()
+        ).hexdigest()
 
 
 def _mqtt_opts() -> dict:
@@ -105,9 +138,10 @@ def _mqtt_opts() -> dict:
 
 
 class Bridge:
-    def __init__(self, options: Options, mqtt: Mqtt) -> None:
+    def __init__(self, options: Options, mqtt_opts: Optional[dict] = None) -> None:
         self.opt = options
-        self.mqtt = mqtt
+        self.mqtt_opts = mqtt_opts or _mqtt_opts()
+        self.mqtt: Optional[Mqtt] = None
         self.client = AlulaClient(
             username=options.username,
             password=options.password,
@@ -117,6 +151,11 @@ class Bridge:
         self._published_zones: set[int] = set()
         self._stop = asyncio.Event()
         self._cmd_lock = asyncio.Lock()
+        self._disarm_lock = asyncio.Lock()
+        self._arm_tasks: set[asyncio.Task] = set()
+        self._bad_codes: list[float] = []
+        self._disarm_locked_until = 0.0
+        self._auth_blocked = False
         self.ha = HaCore()
         # Pending manual-arm request waiting for "bypass and arm" / "cancel".
         self._prompt: Optional[dict] = None
@@ -124,23 +163,95 @@ class Bridge:
 
     # ---- lifecycle -------------------------------------------------------
 
+    async def _sleep(self, seconds: float) -> bool:
+        """Sleep unless stopping. Returns True if a stop was requested."""
+        try:
+            await asyncio.wait_for(self._stop.wait(), timeout=seconds)
+            return True
+        except asyncio.TimeoutError:
+            return False
+
+    # Rejected-credential block, persisted so an add-on/HA restart does not retry
+    # the same bad password. Changing the username or password clears it.
+    def _read_block(self) -> Optional[dict]:
+        try:
+            with open(AUTH_BLOCK_PATH) as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return None
+        if data.get("fingerprint") == self.opt.credentials_fingerprint():
+            return data
+        with contextlib.suppress(OSError):
+            os.remove(AUTH_BLOCK_PATH)  # options changed -> clear
+        return None
+
+    def _write_block(self, notified: bool) -> None:
+        data = {"fingerprint": self.opt.credentials_fingerprint(),
+                "since": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "notified": notified}
+        try:
+            fd = os.open(AUTH_BLOCK_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as f:
+                json.dump(data, f)
+        except OSError as err:
+            _LOGGER.warning("could not save the login block marker: %s", err)
+
+    async def _credentials_rejected(self, block: Optional[dict] = None) -> None:
+        """Stop all logins until the options change; notify once; idle."""
+        self._auth_blocked = True
+        notified = bool(block and block.get("notified"))
+        _LOGGER.error("Alula rejected the username or password. The add-on will not try "
+                      "again until you change them on the Configuration tab.")
+        if not notified:
+            ok = await self.ha.call_service("persistent_notification", "create", {
+                "notification_id": "alula_login",
+                "title": "Alula alarm: login rejected",
+                "message": ("Alula rejected the username or password. The add-on has "
+                            "stopped trying so the account is not locked out. Update them "
+                            "on the add-on's Configuration tab to try again."),
+            })
+            notified = ok
+        self._write_block(notified)
+        with contextlib.suppress(Exception):
+            await self.client.async_close()
+        await self._pub(self._topic("availability"), "offline")
+
+    async def _startup(self) -> bool:
+        """Log in and load the panel, retrying with backoff. False = stop/blocked."""
+        block = self._read_block()
+        if block:
+            await self._credentials_rejected(block)
+            return False
+        delay = 30.0
+        while not self._stop.is_set():
+            try:
+                await self.client.async_login(self.opt.username, self.opt.password)
+                panels = await self.client.async_get_panels()
+                if not panels:
+                    raise UserError("No alarm panel found on this Alula account")
+                self._device_id = panels[0].device_id
+                await self.client.async_connect_ws()
+                await self.client.async_subscribe_device(self._device_id)
+                await self.client.async_refresh_state(self._device_id, budget=45.0)
+                await asyncio.sleep(1)
+                return True
+            except AlulaCredentialsRejected:
+                await self._credentials_rejected()
+                return False
+            except (AlulaError, OSError, asyncio.TimeoutError) as err:
+                wait = max(delay, self.client.login_wait)
+                _LOGGER.warning("Alula startup failed (%s); retrying in %ds", err, int(wait))
+                if await self._sleep(wait):
+                    return False
+                delay = min(STARTUP_BACKOFF_MAX, delay * 2)
+        return False
+
     async def run(self) -> None:
-        await self.client.async_login(self.opt.username, self.opt.password)
-        panels = await self.client.async_get_panels()
-        if not panels:
-            raise AlulaError("No alarm panel found on this Alula account")
-        self._device_id = panels[0].device_id
-        await self.client.async_connect_ws()
-        await self.client.async_subscribe_device(self._device_id)
-        await self.client.async_refresh_state(self._device_id, budget=45.0)
-        await asyncio.sleep(1)
-        await self._publish_discovery()
-        await self._publish_state()
-        await self._subscribe_commands()
-        poll = asyncio.create_task(self._poll_loop())
-        # Must listen for MQTT commands (arm/disarm/bypass). Without this task,
-        # button presses and alarm panel commands are never received.
-        listen = asyncio.create_task(self.mqtt.listen(), name="alula_mqtt_listen")
+        if not await self._startup():
+            await self._stop.wait()  # blocked or stopping: stay up, do nothing
+            await self._shutdown(None)
+            return
+        poll = asyncio.create_task(self._poll_loop(), name="alula_poll")
         ha_events = asyncio.create_task(
             self.ha.listen_events("mobile_app_notification_action", self._on_ha_action, self._stop),
             name="alula_ha_events",
@@ -149,18 +260,76 @@ class Bridge:
             _LOGGER.warning("No Supervisor token: arm prompts will use the dashboard "
                             "sensor/buttons only (no HA notifications)")
         try:
-            await self._stop.wait()
+            await self._mqtt_loop(poll)
         finally:
             poll.cancel()
-            listen.cancel()
             ha_events.cancel()
-            if self._prompt_task:
-                self._prompt_task.cancel()
+            await self._shutdown(None)
+
+    async def _mqtt_loop(self, poll: asyncio.Task) -> None:
+        """Connect to the broker, serve commands, and reconnect with backoff (1-60 s)."""
+        backoff = 1.0
+        while not self._stop.is_set():
+            try:
+                async with Mqtt(**self.mqtt_opts, client_id="alula_bridge",
+                                will_topic=self._topic("availability")) as mqtt:
+                    self.mqtt = mqtt
+                    await self._publish_discovery()
+                    await self._publish_state()
+                    await self._subscribe_commands()
+                    await self._pub(self._topic("availability"),
+                                    "offline" if self._auth_blocked else "online")
+                    _LOGGER.info("MQTT connected")
+                    backoff = 1.0
+                    listen = asyncio.create_task(mqtt.listen(), name="alula_mqtt_listen")
+                    stop = asyncio.create_task(self._stop.wait())
+                    done, _ = await asyncio.wait({listen, stop, poll},
+                                                 return_when=asyncio.FIRST_COMPLETED)
+                    stop.cancel()
+                    if poll in done and not self._stop.is_set():
+                        listen.cancel()
+                        poll.result()  # re-raise an unexpected poll-loop crash
+                        raise RuntimeError("poll loop ended unexpectedly")
+                    if listen in done:
+                        listen.result()  # raises MqttError on a dropped connection
+                        raise MqttError("MQTT message stream ended")
+                    listen.cancel()
+                    with contextlib.suppress(Exception):
+                        await self._pub(self._topic("availability"), "offline")
+                    return
+            except MqttError as err:
+                self.mqtt = None
+                if self._stop.is_set():
+                    return
+                _LOGGER.warning("MQTT connection lost (%s); reconnecting in %ds", err, int(backoff))
+                if await self._sleep(backoff):
+                    return
+                backoff = min(60.0, backoff * 2)
+            finally:
+                self.mqtt = None
+
+    async def _shutdown(self, _exc) -> None:
+        for t in list(self._arm_tasks):
+            t.cancel()
+        if self._prompt_task:
+            self._prompt_task.cancel()
+        with contextlib.suppress(Exception):
             await self.ha.close()
+        with contextlib.suppress(Exception):
             await self.client.async_close()
 
     def request_stop(self) -> None:
         self._stop.set()
+
+    async def _pub(self, topic: str, payload: Any, *, retain: bool = True) -> None:
+        """Publish if connected; drop silently while the broker is away (state is
+        republished in full on reconnect)."""
+        if self.mqtt is None:
+            return
+        try:
+            await self.mqtt.publish(topic, payload, retain=retain)
+        except MqttError as err:
+            _LOGGER.debug("publish to %s dropped: %s", topic, err)
 
     # ---- discovery -------------------------------------------------------
 
@@ -176,7 +345,7 @@ class Bridge:
         }
 
     def _topic(self, *parts: str) -> str:
-        return "/".join((PREFIX, self._device_id, *parts))
+        return "/".join((PREFIX, self._device_id or "unknown", *parts))
 
     async def _publish_discovery(self) -> None:
         assert self._device_id
@@ -189,13 +358,12 @@ class Bridge:
             modes.append("arm_away")
         if levels["night"] or self._night_is_stay_instant(p):
             modes.append("arm_night")
-        # Alarm control panel.
-        # When a 4-digit code is stored in add-on options, tell HA that no code is
-        # required at the UI — the add-on applies the stored code on the wire
-        # (changeArmingLevelUsingCode). When no code is configured, ask HA for a
-        # REMOTE_CODE so the more-info keypad appears and the entered digits are
-        # passed through the MQTT command payload.
-        has_code = bool(self.opt.code and self.opt.code.isdigit() and len(self.opt.code) == 4)
+        # Alarm control panel: arming needs no code; DISARM needs the panel code.
+        # `code: REMOTE_CODE` makes HA report code_format=number, so the more-info
+        # dialog, the alarm panel card and tile keypads ask for a code on disarm
+        # only (code_arm_required=false). The entered digits arrive in the command
+        # payload ("DISARM,<code>") and the add-on checks them against the saved
+        # code before anything is sent to the panel.
         panel_cfg: dict[str, Any] = {
             "name": None,  # use the device name (avoids "Alula Alarm Alula Alarm")
             "object_id": "alula_alarm",
@@ -213,18 +381,12 @@ class Bridge:
             "payload_not_available": "offline",
             "device": self._dev(),
             "json_attributes_topic": self._topic("alarm", "attrs"),
-            "code_arm_required": not has_code,
-            "code_disarm_required": not has_code,
+            "code": "REMOTE_CODE",
+            "code_arm_required": False,
+            "code_disarm_required": True,
             "code_trigger_required": False,
         }
-        if has_code:
-            # Explicitly omit the `code` key so HA does not treat this as a
-            # code-gated panel. (Leaving code_arm_required false is not enough
-            # on some HA versions if `code` is also present.)
-            pass
-        else:
-            panel_cfg["code"] = "REMOTE_CODE"
-        await self.mqtt.publish(
+        await self._pub(
             f"{DISC}/alarm_control_panel/alula_{self._device_id}/config",
             panel_cfg,
         )
@@ -253,9 +415,9 @@ class Bridge:
                 cfg["device_class"] = dc
             if key != "ready" and key != "alarm":
                 cfg["entity_category"] = "diagnostic"
-            await self.mqtt.publish(f"{DISC}/binary_sensor/alula_{self._device_id}_{key}/config", cfg)
+            await self._pub(f"{DISC}/binary_sensor/alula_{self._device_id}_{key}/config", cfg)
 
-        await self.mqtt.publish(
+        await self._pub(
             f"{DISC}/sensor/alula_{self._device_id}_bypassed/config",
             {
                 "name": "Bypassed zones",
@@ -274,7 +436,7 @@ class Bridge:
             ("bypass_open", "Bypass open zones", "mdi:shield-off"),
             ("unbypass_all", "Unbypass all", "mdi:shield-check"),
         ):
-            await self.mqtt.publish(
+            await self._pub(
                 f"{DISC}/button/alula_{self._device_id}_{key}/config",
                 {
                     "name": name,
@@ -295,7 +457,7 @@ class Bridge:
             ("arm_home_bypass", "Arm stay (auto-bypass)", "mdi:shield-home"),
             ("arm_away_bypass", "Arm away (auto-bypass)", "mdi:shield-lock"),
         ):
-            await self.mqtt.publish(
+            await self._pub(
                 f"{DISC}/button/alula_{self._device_id}_{key}/config",
                 {
                     "name": name,
@@ -309,7 +471,7 @@ class Bridge:
                     "device": self._dev(),
                 },
             )
-        await self.mqtt.publish(
+        await self._pub(
             f"{DISC}/sensor/alula_{self._device_id}_arm_prompt/config",
             {
                 "name": "Arm prompt",
@@ -325,7 +487,7 @@ class Bridge:
         )
         await self._publish_prompt()
         await self._discover_zones()
-        await self.mqtt.publish(self._topic("availability"), "online", retain=True)
+        await self._pub(self._topic("availability"), "online", retain=True)
 
     async def _discover_zones(self) -> None:
         assert self._device_id
@@ -344,7 +506,7 @@ class Bridge:
         name = z.name or f"Zone {z.index + 1}"
         slug = slugify(name)
         uid = f"alula_{self._device_id}_z{z.index}"
-        await self.mqtt.publish(
+        await self._pub(
             f"{DISC}/binary_sensor/{uid}/config",
             {
                 "name": name,
@@ -434,8 +596,8 @@ class Bridge:
     async def _publish_state(self) -> None:
         assert self._device_id
         p = self.client.panels[self._device_id]
-        await self.mqtt.publish(self._topic("alarm", "state"), self._alarm_state(p))
-        await self.mqtt.publish(
+        await self._pub(self._topic("alarm", "state"), self._alarm_state(p))
+        await self._pub(
             self._topic("alarm", "attrs"),
             {
                 "arming_level": p.arming_level,
@@ -456,7 +618,7 @@ class Bridge:
         async def onoff(key: str, val: Optional[bool]) -> None:
             if val is None:
                 return
-            await self.mqtt.publish(self._topic("status", key), "ON" if val else "OFF")
+            await self._pub(self._topic("status", key), "ON" if val else "OFF")
 
         await onoff("ready", p.ready)
         await onoff("alarm", p.alarm)
@@ -467,11 +629,11 @@ class Bridge:
         await onoff("remote_arming", p.interactive_enabled)
 
         bypassed = [z for z in p._configured_zones() if z.bypassed]
-        await self.mqtt.publish(
+        await self._pub(
             self._topic("status", "bypassed"),
             ", ".join(z.name or f"zone {z.index + 1}" for z in bypassed) or "none",
         )
-        await self.mqtt.publish(
+        await self._pub(
             self._topic("status", "bypassed_attrs"),
             {"zones": [{"index": z.index, "number": z.index + 1, "name": z.name} for z in bypassed]},
         )
@@ -479,11 +641,11 @@ class Bridge:
             z = p.zones.get(idx)
             if z is None:
                 continue
-            await self.mqtt.publish(
+            await self._pub(
                 self._topic("zone", str(idx), "state"),
                 "ON" if z.open else "OFF",
             )
-            await self.mqtt.publish(
+            await self._pub(
                 self._topic("zone", str(idx), "attrs"),
                 {
                     "zone_index": z.index,
@@ -507,7 +669,7 @@ class Bridge:
                 continue
             await self._discover_zone(z)
             self._published_zones.add(idx)
-            await self.mqtt.publish(
+            await self._pub(
                 self._topic("zone", str(idx), "state"), "ON" if z.open else "OFF"
             )
 
@@ -529,8 +691,12 @@ class Bridge:
                 await self.client.async_connect_ws()
                 await self.client.async_reconcile(self._device_id)
                 await self._publish_state()
-            except AlulaAuthError:
-                _LOGGER.error("Alula authentication failed; will retry")
+            except AlulaCredentialsRejected:
+                await self._credentials_rejected()
+                await self._stop.wait()
+                return
+            except AlulaAuthError as err:
+                _LOGGER.warning("Alula authentication failed (%s); will retry", err)
             except Exception:  # noqa: BLE001
                 _LOGGER.exception("poll failed")
 
@@ -539,6 +705,7 @@ class Bridge:
     async def _subscribe_commands(self) -> None:
         assert self._device_id
         await self.mqtt.subscribe(self._topic("alarm", "set"), self._on_alarm_cmd)
+        await self.mqtt.subscribe(self._topic("alarm", "auto_disarm"), self._on_auto_disarm)
         await self.mqtt.subscribe(self._topic("button", "bypass_open"), self._on_bypass_open)
         await self.mqtt.subscribe(self._topic("button", "unbypass_all"), self._on_unbypass_all)
         await self.mqtt.subscribe(self._topic("button", "prompt_confirm"), self._on_prompt_confirm)
@@ -546,13 +713,51 @@ class Bridge:
         await self.mqtt.subscribe(self._topic("button", "arm_home_bypass"), self._on_arm_home_bypass)
         await self.mqtt.subscribe(self._topic("button", "arm_away_bypass"), self._on_arm_away_bypass)
 
-    def _require_code(self) -> str:
+    def _saved_code(self) -> str:
         c = (self.opt.code or "").strip()
-        if not (c.isdigit() and len(c) == 4):
-            raise AlulaError(
-                "A 4-digit panel user code is required. Set it on the add-on Configuration page."
-            )
+        return c if _valid_pin(c) else ""
+
+    def _arm_code(self) -> str:
+        """Arming needs no code from the user: the saved code goes on the wire."""
+        c = self._saved_code()
+        if not c:
+            raise UserError("Set the 4-digit panel code on the add-on Configuration "
+                            "page to arm from Home Assistant.")
         return c
+
+    def _record_bad_code(self) -> None:
+        now = time.monotonic()
+        self._bad_codes = [t for t in self._bad_codes if now - t < BAD_CODE_WINDOW]
+        self._bad_codes.append(now)
+        if len(self._bad_codes) >= BAD_CODE_LIMIT:
+            self._disarm_locked_until = now + BAD_CODE_LOCKOUT
+            self._bad_codes.clear()
+            _LOGGER.warning("Too many wrong disarm codes; HA disarm locked for %ds",
+                            int(BAD_CODE_LOCKOUT))
+
+    def _check_disarm_code(self, entered: str) -> str:
+        """Return the code to send for DISARM, or raise UserError. The entered code
+        must match the saved add-on code (constant-time compare). With no saved
+        code, a 4-digit entry is passed through and the panel checks it."""
+        now = time.monotonic()
+        if now < self._disarm_locked_until:
+            raise UserError("Too many wrong codes. Disarming from Home Assistant is paused "
+                            f"for {int(self._disarm_locked_until - now) + 1} s. Use the "
+                            "keypad or the Alula app.")
+        entered = (entered or "").strip()
+        if not entered:
+            raise UserError("Disarm needs the 4-digit panel code.")
+        saved = self._saved_code()
+        if saved:
+            if not hmac.compare_digest(entered.encode(), saved.encode()):
+                self._record_bad_code()
+                raise UserError("Wrong code. The alarm was not disarmed.")
+            self._bad_codes.clear()
+            return saved
+        if not _valid_pin(entered):
+            self._record_bad_code()
+            raise UserError("Wrong code. The alarm was not disarmed.")
+        return entered
 
     @staticmethod
     def _pressed(payload: str) -> bool:
@@ -562,7 +767,7 @@ class Bridge:
     def _parse_alarm_payload(payload: str) -> tuple[str, str, bool, Optional[bool]]:
         """-> (command, pin, auto_bypass, instant_override).
 
-        Accepts "ARM_HOME", "ARM_HOME,1234", "ARM_HOME,BYPASS", "ARM_HOME,BYPASS_INSTANT",
+        Accepts "ARM_HOME", "DISARM,1234", "ARM_HOME,BYPASS", "ARM_HOME,BYPASS_INSTANT",
         and the direct MQTT forms "ARM_HOME_BYPASS" / "ARM_AWAY_BYPASS".
         """
         raw = payload.strip()
@@ -574,50 +779,98 @@ class Bridge:
             cmd = cmd[: -len("_BYPASS")]
             bypass = True
         pin = ""
-        for tok in extra.replace("+", " ").replace("_", " ").replace(",", " ").split():
-            t = tok.strip().upper()
-            if t.isdigit():
-                pin = t
-            elif t in CODE_TOKENS_BYPASS or t == "BYPASS":
+        extra_s = extra.strip()
+        if extra_s.isdigit():
+            pin = extra_s
+        else:
+            for tok in extra.replace("+", " ").replace("_", " ").replace(",", " ").split():
+                t = tok.strip().upper()
+                if t.isdigit():
+                    pin = t
+                elif t in CODE_TOKENS_BYPASS or t == "BYPASS":
+                    bypass = True
+                elif t in CODE_TOKENS_INSTANT or t == "INSTANT":
+                    instant = True
+            joined = extra_s.upper()
+            if joined in CODE_TOKENS_BYPASS:
                 bypass = True
-            elif t in CODE_TOKENS_INSTANT or t == "INSTANT":
+            if joined in CODE_TOKENS_INSTANT:
                 instant = True
-        # also accept the joined forms (AUTO_BYPASS, NO_DELAY) before token split
-        joined = extra.strip().upper()
-        if joined in CODE_TOKENS_BYPASS:
-            bypass = True
-        if joined in CODE_TOKENS_INSTANT:
-            instant = True
+            if not pin and extra_s and not (bypass or instant):
+                pin = extra_s  # non-numeric code text: still checked (and rejected)
         return cmd, pin, bypass, instant
 
     async def _on_alarm_cmd(self, topic: str, payload: str) -> None:
         cmd, pin, bypass, instant = self._parse_alarm_payload(payload)
         if cmd == "DISARM":
-            await self._clear_prompt("disarm requested")
-            async with self._cmd_lock:
-                try:
-                    await self.client.async_set_arming_level(
-                        self._device_id, LEVEL_DISARM, self._pin(pin), wait=True
-                    )
-                except Exception as err:  # noqa: BLE001
-                    _LOGGER.error("Disarm failed: %s", err)
-                finally:
-                    await self._refresh_publish()
+            await self._disarm(pin, source="manual")
             return
         mode = {"ARM_HOME": "home", "ARM_AWAY": "away", "ARM_NIGHT": "night"}.get(cmd)
         if mode is None:
-            _LOGGER.warning("Unknown alarm command %r", cmd)
+            _LOGGER.warning("Unknown alarm command %r", cmd[:32])
             return
         # HA's alarm panel gives no caller context over MQTT, so the plain entity
         # command is treated as MANUAL (prompt if zones are open). Automations use
         # code BYPASS or the "Arm ... (auto-bypass)" buttons.
-        await self._arm(mode, auto_bypass=bypass, instant=instant, pin=pin,
+        await self._arm(mode, auto_bypass=bypass, instant=instant,
                         source="automation" if bypass else "manual")
 
-    def _pin(self, override: str = "") -> str:
-        if override.isdigit() and len(override) == 4:
-            return override
-        return self._require_code()
+    def _is_away_armed(self) -> bool:
+        p = self.client.panels[self._device_id]
+        away = self._levels(p)["away"]
+        return bool(away) and p.arming_level == away
+
+    async def _on_auto_disarm(self, topic: str, payload: str) -> None:
+        """Automation-only disarm (arrival). No code in the message: the add-on uses
+        its saved code, and only while armed AWAY, so it can never drop a Stay/Night
+        arm (someone is inside). Publish rights on this topic are limited by the
+        broker ACL to Home Assistant and the add-on."""
+        if payload.strip().upper() != "DISARM":
+            return
+        if not self._is_away_armed():
+            _LOGGER.info("auto_disarm ignored: the alarm is not armed away")
+            return
+        code = self._saved_code()
+        if not code:
+            await self._notify_error("Auto-disarm failed: no panel code is saved in the add-on.")
+            return
+        await self._disarm(code, source="automation", checked=True)
+
+    async def _cancel_arms(self) -> None:
+        current = asyncio.current_task()
+        pending = [t for t in self._arm_tasks if t is not current and not t.done()]
+        for t in pending:
+            t.cancel()
+        if pending:
+            _LOGGER.info("Disarm cancelled %d pending arm command(s)", len(pending))
+            await asyncio.wait(pending, timeout=5)
+
+    async def _disarm(self, entered: str, *, source: str, checked: bool = False) -> None:
+        # DISARM has priority: it never waits behind an arm, bypass or prompt.
+        try:
+            code = entered if checked else self._check_disarm_code(entered)
+        except UserError as err:
+            _LOGGER.warning("Disarm refused: %s", err)
+            await self._notify_error(f"Disarm refused: {err}")
+            await self._refresh_publish()
+            return
+        await self._cancel_arms()
+        await self._clear_prompt("disarm requested")
+        async with self._disarm_lock:
+            try:
+                _LOGGER.info("%s disarm", source)
+                resp = await self.client.async_set_arming_level(
+                    self._device_id, LEVEL_DISARM, code, wait=True
+                )
+                reason = self.client.nak_reason(resp)
+                if reason:
+                    _LOGGER.error("Panel refused disarm: %s", reason)
+                    await self._notify_error("Disarm failed: the panel refused the command.")
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.error("Disarm failed: %s", err)
+                await self._notify_error(self._safe_error("Disarm", err))
+            finally:
+                await self._refresh_publish()
 
     async def _refresh_publish(self) -> None:
         try:
@@ -642,8 +895,27 @@ class Bridge:
         bad = [z for z in opened if z.bypass_allowed is False]
         return ok, bad
 
+    @staticmethod
+    def _safe_error(what: str, err: Exception) -> str:
+        if isinstance(err, UserError):
+            return f"{what} failed: {err}"
+        return (f"{what} failed: the panel or the Alula cloud did not accept the "
+                "command. See the add-on log for details.")
+
     async def _arm(self, mode: str, *, auto_bypass: bool, instant: Optional[bool] = None,
-                   pin: str = "", source: str = "manual") -> None:
+                   source: str = "manual") -> None:
+        task = asyncio.current_task()
+        self._arm_tasks.add(task)
+        try:
+            await self._arm_locked(mode, auto_bypass=auto_bypass, instant=instant,
+                                   source=source)
+        except asyncio.CancelledError:
+            _LOGGER.info("Arm %s cancelled (disarm requested)", mode)
+        finally:
+            self._arm_tasks.discard(task)
+
+    async def _arm_locked(self, mode: str, *, auto_bypass: bool,
+                          instant: Optional[bool], source: str) -> None:
         async with self._cmd_lock:
             p = self.client.panels[self._device_id]
             level, no_delay = self._resolve_mode(p, mode)
@@ -651,17 +923,17 @@ class Bridge:
                 no_delay = no_delay or instant
             try:
                 if not level:
-                    raise AlulaError(f"Mode {mode} is not available on this panel")
-                code = self._pin(pin)
+                    raise UserError(f"Mode {MODE_LABEL.get(mode, mode)} is not available on this panel")
+                code = self._arm_code()
                 disarmed = p.arming_level in (None, LEVEL_DISARM)
                 if disarmed:
                     ok, bad = await self._open_zones_now()
                     if (ok or bad) and not auto_bypass:
-                        await self._start_prompt(mode, level, no_delay, ok, bad, pin)
+                        await self._start_prompt(mode, level, no_delay, ok, bad)
                         return
                     if bad:
                         names = ", ".join(self._zname(z) for z in bad)
-                        raise AlulaError(f"Open zone(s) cannot be bypassed: {names}")
+                        raise UserError(f"Open zone(s) cannot be bypassed: {names}")
                     if ok:
                         _LOGGER.info("%s arm %s: bypassing %d open zone(s)", source, mode, len(ok))
                         await self._bypass_zones(ok)
@@ -673,10 +945,11 @@ class Bridge:
                 )
                 reason = self.client.nak_reason(resp)
                 if reason:
-                    raise AlulaError(f"Panel refused arming: {reason}")
+                    _LOGGER.error("Panel refused arming: %s", reason)
+                    raise UserError("the panel refused the command (is a zone still open?)")
             except Exception as err:  # noqa: BLE001
                 _LOGGER.error("Arm %s failed: %s", mode, err)
-                await self._notify_error(f"Arm {MODE_LABEL.get(mode, mode)} failed: {err}")
+                await self._notify_error(self._safe_error(f"Arm {MODE_LABEL.get(mode, mode)}", err))
             finally:
                 await self._refresh_publish()
 
@@ -686,16 +959,20 @@ class Bridge:
 
     # ---- arm prompt ----------------------------------------------------------
 
+    def _action_ids(self, nonce: str) -> tuple[str, str]:
+        return f"{ACTION_CONFIRM}_{nonce}", f"{ACTION_CANCEL}_{nonce}"
+
     async def _start_prompt(self, mode: str, level: int, no_delay: bool,
-                            ok: list[Zone], bad: list[Zone], pin: str) -> None:
+                            ok: list[Zone], bad: list[Zone]) -> None:
         if self._prompt_task:
             self._prompt_task.cancel()
         timeout = self.opt.prompt_timeout
         expires = datetime.now(timezone.utc) + timedelta(seconds=timeout)
         zones = [self._zname(z) for z in ok]
         blocked = [self._zname(z) for z in bad]
+        nonce = secrets.token_hex(8)  # per-prompt: old/forged phone actions don't match
         self._prompt = {
-            "mode": mode, "level": level, "no_delay": no_delay, "pin": pin,
+            "mode": mode, "level": level, "no_delay": no_delay, "nonce": nonce,
             "zones": zones, "blocked": blocked,
             "expires_at": expires.isoformat(timespec="seconds"),
             "deadline": time.monotonic() + timeout,
@@ -715,6 +992,7 @@ class Bridge:
             "notification_id": PROMPT_TAG, "title": "Alarm: open zones", "message": msg,
         })
         short = ", ".join(zones + blocked)
+        confirm_id, cancel_id = self._action_ids(nonce)
         for svc in self.opt.notify_list:
             await self.ha.call_service("notify", svc, {
                 "title": "Alarm: open zones",
@@ -725,8 +1003,8 @@ class Bridge:
                     "priority": "high",
                     "ttl": 0,
                     "actions": [
-                        {"action": ACTION_CONFIRM, "title": "Bypass and arm"},
-                        {"action": ACTION_CANCEL, "title": "Cancel"},
+                        {"action": confirm_id, "title": "Bypass and arm"},
+                        {"action": cancel_id, "title": "Cancel"},
                     ],
                 },
             })
@@ -742,13 +1020,21 @@ class Bridge:
             self._prompt_task = None
             await self._clear_prompt("expired")
 
-    async def _clear_prompt(self, reason: str) -> None:
-        if self._prompt is None:
-            return
-        self._prompt = None
+    def _take_prompt(self) -> Optional[dict]:
+        """Atomically claim the pending prompt (no await), so two confirmations
+        arriving together cannot both act on it."""
+        pr, self._prompt = self._prompt, None
         task, self._prompt_task = self._prompt_task, None
         if task and task is not asyncio.current_task():
             task.cancel()
+        return pr
+
+    async def _clear_prompt(self, reason: str) -> None:
+        if self._take_prompt() is None:
+            return
+        await self._dismiss_prompt(reason)
+
+    async def _dismiss_prompt(self, reason: str) -> None:
         _LOGGER.debug("arm prompt cleared (%s)", reason)
         await self._publish_prompt(last=reason)
         await self.ha.call_service("persistent_notification", "dismiss",
@@ -761,12 +1047,12 @@ class Bridge:
     async def _publish_prompt(self, last: str = "") -> None:
         pr = self._prompt
         if pr is None:
-            await self.mqtt.publish(self._topic("prompt", "state"), "idle")
-            await self.mqtt.publish(self._topic("prompt", "attrs"),
-                                    {"mode": None, "open_zones": [], "last_result": last or None})
+            await self._pub(self._topic("prompt", "state"), "idle")
+            await self._pub(self._topic("prompt", "attrs"),
+                            {"mode": None, "open_zones": [], "last_result": last or None})
             return
-        await self.mqtt.publish(self._topic("prompt", "state"), "waiting")
-        await self.mqtt.publish(self._topic("prompt", "attrs"), {
+        await self._pub(self._topic("prompt", "state"), "waiting")
+        await self._pub(self._topic("prompt", "attrs"), {
             "mode": pr["mode"],
             "mode_label": MODE_LABEL.get(pr["mode"], pr["mode"]),
             "no_entry_delay": pr["no_delay"],
@@ -777,15 +1063,16 @@ class Bridge:
         })
 
     async def _confirm_prompt(self) -> None:
-        pr = self._prompt
+        pr = self._take_prompt()
         if pr is None or time.monotonic() > pr["deadline"]:
             _LOGGER.info("No pending arm request to confirm")
-            await self._clear_prompt("expired")
+            if pr is not None:
+                await self._dismiss_prompt("expired")
             return
         _LOGGER.info("Arm prompt confirmed: bypass open zones and arm %s", pr["mode"])
+        await self._dismiss_prompt("confirmed")
         await self._arm(pr["mode"], auto_bypass=True, instant=pr["no_delay"] or None,
-                        pin=pr["pin"], source="confirmed")
-        await self._clear_prompt("confirmed")
+                        source="confirmed")
 
     async def _on_prompt_confirm(self, topic: str, payload: str) -> None:
         if self._pressed(payload):
@@ -805,12 +1092,32 @@ class Bridge:
             await self._arm("away", auto_bypass=True, source="automation")
 
     async def _on_ha_action(self, event: dict) -> None:
-        action = (event.get("data") or {}).get("action")
-        if action == ACTION_CONFIRM:
-            await self._confirm_prompt()
-        elif action == ACTION_CANCEL:
+        data = event.get("data") or {}
+        action = str(data.get("action") or "")
+        if not action.startswith("ALULA_"):
+            return
+        pr = self._prompt
+        if pr is None:
+            _LOGGER.info("Phone action ignored: no pending arm request")
+            return
+        # The tag (when the app reports it) must be ours, and the action must carry
+        # this prompt's nonce, so a stale notification or a forged event can't arm.
+        tag = data.get("tag")
+        if tag is not None and tag != PROMPT_TAG:
+            _LOGGER.warning("Phone action ignored: unexpected notification tag")
+            return
+        confirm_id, cancel_id = self._action_ids(pr["nonce"])
+        if hmac.compare_digest(action, confirm_id):
+            # Own task: the arm must be cancellable by DISARM without touching the
+            # HA event listener that delivered this action.
+            t = asyncio.create_task(self._confirm_prompt(), name="alula_prompt_confirm")
+            self._arm_tasks.add(t)
+            t.add_done_callback(self._arm_tasks.discard)
+        elif hmac.compare_digest(action, cancel_id):
             _LOGGER.info("Arm prompt cancelled from phone")
             await self._clear_prompt("cancelled")
+        else:
+            _LOGGER.warning("Phone action ignored: it does not match the pending request")
 
     async def _notify_error(self, text: str) -> None:
         await self.ha.call_service("persistent_notification", "create", {
@@ -818,7 +1125,7 @@ class Bridge:
         })
 
     async def _on_bypass_open(self, topic: str, payload: str) -> None:
-        if payload.strip().upper() not in ("PRESS", "ON", "1"):
+        if not self._pressed(payload):
             return
         async with self._cmd_lock:
             try:
@@ -827,7 +1134,7 @@ class Bridge:
                 _LOGGER.error("Bypass open zones failed: %s", err)
 
     async def _on_unbypass_all(self, topic: str, payload: str) -> None:
-        if payload.strip().upper() not in ("PRESS", "ON", "1"):
+        if not self._pressed(payload):
             return
         async with self._cmd_lock:
             try:
@@ -894,7 +1201,7 @@ class Bridge:
         await self._publish_state()
 
 
-async def main(options_path: str = "/data/options.json") -> None:
+async def main(options_path: str = "/data/options.json") -> int:
     options = Options.from_options_file(options_path)
     logging.basicConfig(
         level=getattr(logging, options.log_level.upper(), logging.INFO),
@@ -905,28 +1212,18 @@ async def main(options_path: str = "/data/options.json") -> None:
         "Starting Alula bridge (MQTT %s:%s, poll %ss)",
         mqtt_opts["host"], mqtt_opts["port"], options.poll_interval,
     )
-    stop = asyncio.get_event_loop().create_future()
-
-    def _sig(*_):
-        if not stop.done():
-            stop.set_result(None)
-
+    bridge = Bridge(options, mqtt_opts)
+    loop = asyncio.get_running_loop()
     for s in (signal.SIGTERM, signal.SIGINT):
         try:
-            asyncio.get_event_loop().add_signal_handler(s, _sig)
+            loop.add_signal_handler(s, bridge.request_stop)
         except NotImplementedError:
-            signal.signal(s, lambda *_: _sig())
-
-    async with Mqtt(**mqtt_opts, client_id="alula_bridge") as mqtt:
-        bridge = Bridge(options, mqtt)
-        task = asyncio.create_task(bridge.run())
-        await stop
-        bridge.request_stop()
-        try:
-            await asyncio.wait_for(task, timeout=15)
-        except (asyncio.TimeoutError, asyncio.CancelledError):
-            task.cancel()
-        try:
-            await mqtt.publish(bridge._topic("availability"), "offline", retain=True)
-        except Exception:  # noqa: BLE001
-            pass
+            signal.signal(s, lambda *_: bridge.request_stop())
+    try:
+        await bridge.run()
+    except Exception:  # noqa: BLE001
+        # Exit non-zero so the Supervisor watchdog restarts the add-on; the broker
+        # has already published our last-will "offline".
+        _LOGGER.exception("Alula bridge stopped on an unexpected error; exiting")
+        return 1
+    return 0

@@ -11,6 +11,6 @@ from .bridge import main
 if __name__ == "__main__":
     path = os.environ.get("OPTIONS_PATH", "/data/options.json")
     try:
-        asyncio.run(main(path))
+        sys.exit(asyncio.run(main(path)))
     except KeyboardInterrupt:
         sys.exit(0)

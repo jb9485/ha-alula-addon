@@ -12,8 +12,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 import uuid
+from email.utils import parsedate_to_datetime
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Optional
 
@@ -82,6 +84,50 @@ class AlulaError(Exception):
 
 class AlulaAuthError(AlulaError):
     """Login / token failure (bad credentials, invalid_client, etc.)."""
+
+
+class AlulaCredentialsRejected(AlulaAuthError):
+    """The Alula server rejected the username/password itself (not a network or
+    server problem). Retrying with the same credentials can lock the account."""
+
+
+class AlulaRateLimited(AlulaAuthError):
+    """HTTP 429 from the token endpoint."""
+
+    def __init__(self, msg: str, retry_after: Optional[float]) -> None:
+        super().__init__(msg)
+        self.retry_after = retry_after
+
+
+# Password-login backoff: 30 s, 60 s, 2 min ... capped at 30 min.
+_LOGIN_BACKOFF_START = 30.0
+_LOGIN_BACKOFF_MAX = 1800.0
+_REJECTED_OAUTH_ERRORS = {"invalid_grant", "invalid_credentials", "access_denied",
+                          "unauthorized", "invalid_user"}
+
+
+def _parse_retry_after(value: Optional[str]) -> Optional[float]:
+    if not value:
+        return None
+    value = value.strip()
+    if value.isdigit():
+        return float(value)
+    try:
+        dt = parsedate_to_datetime(value)
+        return max(0.0, dt.timestamp() - time.time())
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return None
+
+
+def _oauth_error_code(text: str) -> str:
+    """Just the OAuth `error` code (e.g. invalid_grant), never the raw body."""
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return ""
+    code = data.get("error") if isinstance(data, dict) else None
+    code = str(code or "")
+    return code if re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", code) else ""
 
 
 def _pin_to_array(pin: str) -> list[str]:
@@ -410,6 +456,10 @@ class AlulaClient:
         # device_id -> "code" | "partition": the arming command family confirmed to work on
         # this panel (learned when a command is accepted, so we skip the failing one after).
         self._arming_command_kind: dict[str, str] = {}
+        # Password-login throttle (prevents a retry storm / account lockout).
+        self._login_not_before = 0.0
+        self._login_failures = 0
+        self.credentials_rejected = False
 
     # ---- lifecycle -------------------------------------------------------
 
@@ -446,12 +496,40 @@ class AlulaClient:
             if asyncio.iscoroutine(res):
                 await res
 
+    @property
+    def login_wait(self) -> float:
+        """Seconds until the next password login is allowed (0 = now)."""
+        return max(0.0, self._login_not_before - time.time())
+
     async def async_login(self, username: str, password: str) -> None:
-        await self._token_request({
-            "grant_type": "password",
-            "username": username,
-            "password": password,
-        })
+        """Password login, throttled. After a failure the next attempt waits 30 s,
+        doubling up to 30 min (or the server's Retry-After, if longer). A rejected
+        password is never retried by this client instance."""
+        if self.credentials_rejected:
+            raise AlulaCredentialsRejected("Alula rejected the username or password")
+        wait = self.login_wait
+        if wait > 0:
+            raise AlulaAuthError(f"login backoff: next attempt in {int(wait)}s")
+        try:
+            await self._token_request({
+                "grant_type": "password",
+                "username": username,
+                "password": password,
+            }, password_grant=True)
+        except AlulaCredentialsRejected:
+            self.credentials_rejected = True
+            raise
+        except AlulaError as err:
+            self._login_failures += 1
+            delay = min(_LOGIN_BACKOFF_MAX,
+                        _LOGIN_BACKOFF_START * (2 ** (self._login_failures - 1)))
+            if isinstance(err, AlulaRateLimited) and err.retry_after:
+                delay = max(delay, float(err.retry_after))
+            self._login_not_before = time.time() + delay
+            _LOGGER.warning("Alula login failed (%s); next attempt in %ds", err, int(delay))
+            raise
+        self._login_failures = 0
+        self._login_not_before = 0.0
 
     async def async_refresh(self) -> None:
         if not self._token.is_refreshable:
@@ -471,7 +549,7 @@ class AlulaClient:
                 await self.async_refresh()
                 return
             except AlulaAuthError as err:
-                if not (self._username and self._password):
+                if isinstance(err, AlulaRateLimited) or not (self._username and self._password):
                     raise
                 _LOGGER.warning(
                     "Alula token refresh rejected (%s); re-logging in with stored "
@@ -489,7 +567,7 @@ class AlulaClient:
             if self._token.is_expired or not self._token.access_token:
                 await self._refresh_or_login()
 
-    async def _token_request(self, extra: dict) -> None:
+    async def _token_request(self, extra: dict, *, password_grant: bool = False) -> None:
         session = await self._ensure_session()
         data = {"client_id": CLIENT_ID, "client_secret": CLIENT_SECRET, **extra}
         headers = {
@@ -497,19 +575,29 @@ class AlulaClient:
             "Content-Type": "application/x-www-form-urlencoded",
             "User-Agent": USER_AGENT,
         }
-        async with session.post(TOKEN_URL, data=data, headers=headers) as resp:
-            text = await resp.text()
-            if resp.status == 429:
-                retry = resp.headers.get("Retry-After", "?")
-                raise AlulaAuthError(f"rate limited (HTTP 429), retry after {retry}s")
-            if resp.status >= 400:
-                raise AlulaAuthError(f"token request failed HTTP {resp.status}: {text[:300]}")
-            try:
-                payload = json.loads(text)
-            except ValueError as err:
-                raise AlulaAuthError(f"bad token response: {text[:200]}") from err
-        if "access_token" not in payload:
-            raise AlulaAuthError(f"no access_token in response: {payload}")
+        try:
+            async with session.post(TOKEN_URL, data=data, headers=headers,
+                                    timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                text = await resp.text()
+                status = resp.status
+                retry_after = _parse_retry_after(resp.headers.get("Retry-After"))
+        except (aiohttp.ClientError, asyncio.TimeoutError) as err:
+            raise AlulaAuthError(f"token endpoint unreachable ({type(err).__name__})") from None
+        # Error messages carry only the HTTP status and the OAuth error code, never the
+        # response body (it can echo request fields) or anything we sent.
+        if status == 429:
+            raise AlulaRateLimited("rate limited (HTTP 429)", retry_after)
+        if status >= 400:
+            code = _oauth_error_code(text)
+            if password_grant and status in (400, 401) and code in _REJECTED_OAUTH_ERRORS:
+                raise AlulaCredentialsRejected(f"credentials rejected (HTTP {status} {code})")
+            raise AlulaAuthError(f"token request failed (HTTP {status} {code})".replace(" )", ")"))
+        try:
+            payload = json.loads(text)
+        except ValueError:
+            raise AlulaAuthError("bad token response (not JSON)") from None
+        if not isinstance(payload, dict) or "access_token" not in payload:
+            raise AlulaAuthError("no access_token in token response")
         self._token.update_from_response(payload)
         await self._notify_token()
 
@@ -541,7 +629,9 @@ class AlulaClient:
                     await self._refresh_or_login()
                 return await self._rest(method, path, json_body=json_body, retry_auth=False)
             if resp.status >= 400:
-                raise AlulaError(f"{method} {path} -> HTTP {resp.status}: {text[:300]}")
+                _LOGGER.debug("%s %s -> HTTP %s: %s", method, path.split("?")[0],
+                              resp.status, text[:200])
+                raise AlulaError(f"{method} {path.split('?')[0]} -> HTTP {resp.status}")
             if not text:
                 return None
             try:
@@ -651,6 +741,8 @@ class AlulaClient:
                 ttl = self._token.expires_at - time.time()
                 # wake ~75s before expiry; clamp so we always make forward progress
                 await asyncio.sleep(max(5.0, min(ttl - 75.0, 600.0)))
+                if self.credentials_rejected:
+                    return
                 if not self._token.is_refreshable:
                     continue
                 if self._token.expires_at - time.time() > 90.0:

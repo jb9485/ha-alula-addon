@@ -7,7 +7,7 @@ configuration:
     description: Password for that Alula account.
   code:
     name: Panel user code
-    description: 4-digit DSC user code used to arm and disarm. Leave blank to refuse arm/disarm commands until set. Bypass does not need a code.
+    description: 4-digit DSC user code. Arming from Home Assistant uses it automatically (no code prompt). Disarming asks for the code in Home Assistant and only goes through if it matches this one. Leave blank to refuse arming until set.
   poll_interval:
     name: Poll interval (seconds)
     description: How often to re-read panel state as a fallback. Live updates arrive over the Alula WebSocket.
@@ -31,7 +31,7 @@ configuration:
     description: How long a manual arm with open zones waits for "Bypass open zones and arm" or "Cancel arm" before it is dropped.
   notify_services:
     name: Phone notify services
-    description: Optional. Comma-separated notify services (for example mobile_app_my_phone) that get an actionable "Bypass and arm / Cancel" notification when a manual arm finds open zones.
+    description: Optional. Comma-separated notify services (for example mobile_app_my_phone; lowercase letters, digits and _ only) that get an actionable "Bypass and arm / Cancel" notification when a manual arm finds open zones.
   device_name:
     name: Device name
     description: Friendly name shown in Home Assistant for the alarm panel device.

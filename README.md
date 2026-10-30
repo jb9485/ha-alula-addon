@@ -34,7 +34,7 @@ go through `changeArmingLevelUsingCode`; zone bypass goes through
 
 | Entity | Purpose |
 |---|---|
-| `alarm_control_panel.*` | Arm Home / Away / Night and Disarm. Manual arming with open zones asks before bypassing (see DOCS). The stored code is applied by the add-on so HA does not prompt. |
+| `alarm_control_panel.*` | Arm Home / Away / Night and Disarm. Manual arming with open zones asks before bypassing (see DOCS). Arming needs no code; **disarm asks for the panel code** and the add-on checks it against the saved code. |
 | `binary_sensor.*` (one per zone) | Open / closed for every named zone. |
 | Status sensors | Ready to arm, Alarm, Tamper, **AC failure**, Low battery, Remote arming enabled (informational only — does **not** block commands). |
 | `button.*_bypass_open_zones` | Bypass every currently open, bypassable zone (refused while armed). |
@@ -52,7 +52,7 @@ is hard-coded.
 | Option | Meaning |
 |---|---|
 | `username` / `password` | Alula Security app login |
-| `code` | 4-digit DSC user code (optional; required to arm/disarm) |
+| `code` | 4-digit DSC user code (used for arming; disarm entries must match it) |
 | `poll_interval` | Fallback poll seconds (default 30; live updates are push) |
 | `level_home` / `level_away` / `level_night` | Override the panel's arming-level numbers (`0` = auto) |
 | `stay_instant` | Arm Home / Stay always with no entry delay (default off) |

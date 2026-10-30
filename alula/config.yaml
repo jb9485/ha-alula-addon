@@ -1,5 +1,5 @@
 name: Alula BAT-Connect
-version: "0.2.0"
+version: "0.3.0"
 slug: alula
 description: >
   Bridge an Alula BAT-Connect (DSC PowerSeries) alarm panel to Home Assistant
@@ -42,5 +42,3 @@ schema:
   notify_services: str?
   device_name: str
   log_level: list(debug|info|warning|error)
-map:
-  - ssl:ro
