@@ -111,50 +111,35 @@ door zones trip immediately instead of starting the entry delay.
 
 ### Disarming from an automation (arrival)
 
-Don't put the code in an automation. Publish to the add-on's automation-only
-disarm topic instead:
+Don't put the code in an automation. Fire the `alula_auto_disarm` event from the
+automation instead:
 
 ```yaml
-- action: mqtt.publish
-  data:
-    topic: alula/<device id>/alarm/auto_disarm
-    payload: DISARM
+- event: alula_auto_disarm
 ```
 
-The add-on then disarms with its saved code, but **only while the alarm is armed
-Away**; it ignores this topic in Stay / Night (someone is inside) or when
-disarmed. Protect the topic with a broker ACL so that only Home Assistant
-(`homeassistant`) and add-ons (`addons`) may publish to `alula/#`; see
-"Securing the broker" below. The device id is in the topics shown on
-**Settings → Devices → Alula Alarm → MQTT info**.
+The add-on listens for this event on Home Assistant's event bus (not MQTT) and
+then disarms with its saved code, but only when:
+
+- the event was fired by an automation or script on this Home Assistant, with
+  no user in its context. Events fired by a person or a phone through the API,
+  the websocket or the mobile-app webhook carry a user id, and the add-on
+  ignores them, and
+- the alarm is armed **Away**. In Stay or Night someone is inside, and when the
+  alarm is already disarmed there is nothing to do, so the event is ignored.
+
+An MQTT topic isn't used because the Mosquitto add-on lets every Home Assistant
+user log in to the broker, and its ACLs can't restrict that (see below).
 
 ## Securing the broker
 
-Anyone who can publish to `alula/#` can arm, bypass and (via `auto_disarm`, Away
-only) disarm. With the Mosquitto add-on, every Home Assistant user can log in to
-the broker by default, so add an ACL (Mosquitto **customize** → `/share/mosquitto`):
-
-```text
-# /share/mosquitto/acl.conf
-acl_file /share/mosquitto/accesscontrollist
-```
-
-```text
-# /share/mosquitto/accesscontrollist
-user homeassistant
-topic readwrite #
-
-user addons
-topic readwrite #
-
-# every other broker user: deny the alarm, then allow what that client needs
-user my_other_mqtt_user
-topic deny alula/#
-topic readwrite my_device_topics/#
-```
-
-Note that `addons` is shared by every add-on that uses the Supervisor's MQTT
-service.
+Anyone who can publish to `alula/#` can arm and bypass zones. Disarm always
+needs the code. With the Mosquitto add-on (7.x), every Home Assistant user can
+log in to the broker. Its authentication plugin also treats every user as a
+superuser, so an `acl_file` in `/share/mosquitto` has **no effect**. We tested
+this. To keep other devices off the alarm topics, close the broker's LAN ports
+(set 1883/1884 to blank on the Mosquitto add-on's **Network** card) if nothing
+on your LAN needs them. Add-ons and Home Assistant still connect internally.
 
 ## Reliability
 

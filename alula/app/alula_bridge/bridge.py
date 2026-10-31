@@ -153,6 +153,7 @@ class Bridge:
         self._cmd_lock = asyncio.Lock()
         self._disarm_lock = asyncio.Lock()
         self._arm_tasks: set[asyncio.Task] = set()
+        self._bg_tasks: set[asyncio.Task] = set()
         self._bad_codes: list[float] = []
         self._disarm_locked_until = 0.0
         self._auth_blocked = False
@@ -256,6 +257,10 @@ class Bridge:
             self.ha.listen_events("mobile_app_notification_action", self._on_ha_action, self._stop),
             name="alula_ha_events",
         )
+        ha_disarm = asyncio.create_task(
+            self.ha.listen_events("alula_auto_disarm", self._on_ha_auto_disarm, self._stop),
+            name="alula_ha_auto_disarm",
+        )
         if not self.ha.available:
             _LOGGER.warning("No Supervisor token: arm prompts will use the dashboard "
                             "sensor/buttons only (no HA notifications)")
@@ -264,6 +269,7 @@ class Bridge:
         finally:
             poll.cancel()
             ha_events.cancel()
+            ha_disarm.cancel()
             await self._shutdown(None)
 
     async def _mqtt_loop(self, poll: asyncio.Task) -> None:
@@ -705,7 +711,6 @@ class Bridge:
     async def _subscribe_commands(self) -> None:
         assert self._device_id
         await self.mqtt.subscribe(self._topic("alarm", "set"), self._on_alarm_cmd)
-        await self.mqtt.subscribe(self._topic("alarm", "auto_disarm"), self._on_auto_disarm)
         await self.mqtt.subscribe(self._topic("button", "bypass_open"), self._on_bypass_open)
         await self.mqtt.subscribe(self._topic("button", "unbypass_all"), self._on_unbypass_all)
         await self.mqtt.subscribe(self._topic("button", "prompt_confirm"), self._on_prompt_confirm)
@@ -820,13 +825,24 @@ class Bridge:
         away = self._levels(p)["away"]
         return bool(away) and p.arming_level == away
 
-    async def _on_auto_disarm(self, topic: str, payload: str) -> None:
-        """Automation-only disarm (arrival). No code in the message: the add-on uses
-        its saved code, and only while armed AWAY, so it can never drop a Stay/Night
-        arm (someone is inside). Publish rights on this topic are limited by the
-        broker ACL to Home Assistant and the add-on."""
-        if payload.strip().upper() != "DISARM":
+    async def _on_ha_auto_disarm(self, event: dict) -> None:
+        """Automation-only disarm (arrival), via the HA event `alula_auto_disarm`.
+
+        Not an MQTT command: the broker can't restrict who publishes. The event must
+        come from this HA instance with no user in its context, which is how events
+        fired by an automation's `event:` action look. Events fired by a person or a
+        phone (websocket/REST/mobile-app webhook) carry a user id and are ignored.
+        The add-on then uses its saved code, and only while armed AWAY, so it can
+        never drop a Stay/Night arm (someone is inside)."""
+        ctx = event.get("context") or {}
+        if event.get("origin") not in (None, "LOCAL") or ctx.get("user_id"):
+            _LOGGER.warning("alula_auto_disarm ignored: not fired by an automation")
             return
+        t = asyncio.create_task(self._auto_disarm(), name="alula_auto_disarm")
+        self._bg_tasks.add(t)
+        t.add_done_callback(self._bg_tasks.discard)
+
+    async def _auto_disarm(self) -> None:
         if not self._is_away_armed():
             _LOGGER.info("auto_disarm ignored: the alarm is not armed away")
             return

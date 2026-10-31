@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.1
+
+- Automation disarm moved from the MQTT `alarm/auto_disarm` topic to the Home
+  Assistant event `alula_auto_disarm`. The add-on accepts it only from an
+  automation or script (no user in the event context, local origin) and only
+  while armed Away. The MQTT topic was removed, because the Mosquitto add-on's
+  ACLs cannot restrict which broker users publish to it.
+
 ## 0.3.0
 
 Security and reliability release.
@@ -9,9 +17,8 @@ Security and reliability release.
   `code_disarm_required: true`, so HA's keypad appears on disarm only. The add-on
   checks the entered code against the saved code (constant-time) before sending
   anything; 5 wrong codes in 10 min pause HA disarm for 2 min.
-- New automation-only `alula/<device id>/alarm/auto_disarm` topic (payload
-  `DISARM`): disarms with the saved code, only while armed Away. Lock it down
-  with a broker ACL (see DOCS).
+- New automation-only disarm path: disarms with the saved code, only while
+  armed Away. 0.3.0 used an MQTT topic; 0.3.1 replaced it with an HA event.
 - MQTT last-will (`offline`), automatic broker reconnect with backoff, retained
   commands ignored, non-zero exit on an unexpected error so the Supervisor
   watchdog can restart the add-on.
