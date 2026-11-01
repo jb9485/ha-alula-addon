@@ -147,6 +147,19 @@ on your LAN needs them. Add-ons and Home Assistant still connect internally.
   entity unavailable instead of HA showing stale alarm state.
 - It reconnects to the broker on its own (1 s backoff, doubling to 60 s) and
   ignores retained command messages.
+- At startup it waits up to 5 minutes for Supervisor to provide the MQTT broker
+  credentials (the Mosquitto add-on can register a little late, e.g. after a
+  restore). It never connects anonymously; if the credentials don't appear it
+  exits so it is restarted.
+- If the broker rejects its credentials, or it can't reconnect for 5 minutes,
+  it exits so a restart fetches fresh credentials from Supervisor instead of
+  retrying forever.
+- A **Last poll** diagnostic sensor (`sensor.alula_alarm_last_poll`) holds the
+  time of the last successful Alula poll. It goes unavailable if polling stops
+  for `max(300 s, 4 × poll_interval)`, and its value shows the real age even if
+  the broker still holds an old retained `online` (for example after restoring
+  a backup). An automation can restart the add-on when it is stale or the alarm
+  entity is unavailable.
 - An unexpected internal error exits the add-on with a non-zero status; turn on
   **Watchdog** on the add-on's Info tab so the Supervisor restarts it.
 - Commands run independently, and **Disarm always goes first**: it cancels an

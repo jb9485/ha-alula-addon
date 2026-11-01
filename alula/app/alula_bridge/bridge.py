@@ -36,7 +36,7 @@ from .api import (
     Zone,
 )
 from .ha_core import HaCore
-from .mqtt_client import Mqtt, MqttError
+from .mqtt_client import Mqtt, MqttCodeError, MqttError
 from .zones import device_class, is_placeholder, slugify
 
 _LOGGER = logging.getLogger(__name__)
@@ -57,6 +57,32 @@ BAD_CODE_LIMIT = 5
 BAD_CODE_WINDOW = 600.0
 BAD_CODE_LOCKOUT = 120.0
 STARTUP_BACKOFF_MAX = 1800.0
+# MQTT CONNACK codes for rejected credentials (MQTT 3.1.1: 4, 5; MQTT 5: 134, 135).
+MQTT_AUTH_CODES = {4, 5, 134, 135}
+# Give up and exit (so Supervisor restarts the add-on and it re-reads the broker
+# credentials) after this long without a working broker connection.
+MQTT_GIVE_UP_SECONDS = float(os.environ.get("ALULA_MQTT_GIVE_UP", "300"))
+# Pause before exiting on rejected broker credentials, so a restart loop is slow.
+MQTT_AUTH_EXIT_DELAY = float(os.environ.get("ALULA_MQTT_AUTH_EXIT_DELAY", "30"))
+
+
+class MqttFatal(Exception):
+    """The broker connection cannot recover in-process; exit non-zero."""
+
+
+def _mqtt_rc(err: BaseException) -> Optional[int]:
+    if not isinstance(err, MqttCodeError):
+        return None
+    rc = getattr(err, "rc", None)
+    value = getattr(rc, "value", rc)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_mqtt_auth_error(err: BaseException) -> bool:
+    return _mqtt_rc(err) in MQTT_AUTH_CODES
 
 
 class UserError(AlulaError):
@@ -161,6 +187,7 @@ class Bridge:
         # Pending manual-arm request waiting for "bypass and arm" / "cancel".
         self._prompt: Optional[dict] = None
         self._prompt_task: Optional[asyncio.Task] = None
+        self._last_poll: Optional[datetime] = None
 
     # ---- lifecycle -------------------------------------------------------
 
@@ -235,6 +262,7 @@ class Bridge:
                 await self.client.async_subscribe_device(self._device_id)
                 await self.client.async_refresh_state(self._device_id, budget=45.0)
                 await asyncio.sleep(1)
+                self._last_poll = datetime.now(timezone.utc)
                 return True
             except AlulaCredentialsRejected:
                 await self._credentials_rejected()
@@ -275,6 +303,7 @@ class Bridge:
     async def _mqtt_loop(self, poll: asyncio.Task) -> None:
         """Connect to the broker, serve commands, and reconnect with backoff (1-60 s)."""
         backoff = 1.0
+        failing_since: Optional[float] = None
         while not self._stop.is_set():
             try:
                 async with Mqtt(**self.mqtt_opts, client_id="alula_bridge",
@@ -285,8 +314,10 @@ class Bridge:
                     await self._subscribe_commands()
                     await self._pub(self._topic("availability"),
                                     "offline" if self._auth_blocked else "online")
+                    await self._publish_last_poll()
                     _LOGGER.info("MQTT connected")
                     backoff = 1.0
+                    failing_since = None
                     listen = asyncio.create_task(mqtt.listen(), name="alula_mqtt_listen")
                     stop = asyncio.create_task(self._stop.wait())
                     done, _ = await asyncio.wait({listen, stop, poll},
@@ -307,6 +338,20 @@ class Bridge:
                 self.mqtt = None
                 if self._stop.is_set():
                     return
+                if _is_mqtt_auth_error(err):
+                    _LOGGER.error(
+                        "MQTT broker rejected the add-on's credentials (%s); exiting in %ds "
+                        "so the add-on restarts and fetches fresh credentials from Supervisor",
+                        err, int(MQTT_AUTH_EXIT_DELAY))
+                    await self._sleep(MQTT_AUTH_EXIT_DELAY)
+                    raise MqttFatal(f"MQTT authentication failed: {err}") from err
+                now = time.monotonic()
+                if failing_since is None:
+                    failing_since = now
+                elif now - failing_since >= MQTT_GIVE_UP_SECONDS:
+                    _LOGGER.error("MQTT broker unreachable for %ds (%s); exiting so the "
+                                  "add-on restarts", int(now - failing_since), err)
+                    raise MqttFatal(f"MQTT unavailable: {err}") from err
                 _LOGGER.warning("MQTT connection lost (%s); reconnecting in %ds", err, int(backoff))
                 if await self._sleep(backoff):
                     return
@@ -488,6 +533,28 @@ class Bridge:
                 "payload_available": "online",
                 "payload_not_available": "offline",
                 "icon": "mdi:shield-alert-outline",
+                "device": self._dev(),
+            },
+        )
+        # Last successful Alula poll (UTC timestamp), published after each poll
+        # that reached the panel and on connect. It expires (goes unavailable)
+        # if polling stops, and its value shows staleness even when the broker
+        # still holds an old retained "online" (e.g. after restoring a backup),
+        # so an HA automation can restart the add-on.
+        await self._pub(
+            f"{DISC}/sensor/alula_{self._device_id}_last_poll/config",
+            {
+                "name": "Last poll",
+                "object_id": "alula_alarm_last_poll",
+                "unique_id": f"alula_{self._device_id}_last_poll",
+                "state_topic": self._topic("last_poll"),
+                "device_class": "timestamp",
+                "entity_category": "diagnostic",
+                "expire_after": self._last_poll_expiry(),
+                "availability_topic": self._topic("availability"),
+                "payload_available": "online",
+                "payload_not_available": "offline",
+                "icon": "mdi:cloud-check-outline",
                 "device": self._dev(),
             },
         )
@@ -685,6 +752,17 @@ class Bridge:
         except Exception:  # noqa: BLE001
             _LOGGER.exception("failed to publish push update")
 
+    def _last_poll_expiry(self) -> int:
+        return int(max(300, 4 * self.opt.poll_interval))
+
+    async def _publish_last_poll(self) -> None:
+        """Publish the time of the last successful poll (retained; HA compares
+        its age, so a stale retained value is detected rather than trusted)."""
+        if self._last_poll is None:
+            return
+        await self._pub(self._topic("last_poll"),
+                        self._last_poll.isoformat(timespec="seconds"), retain=True)
+
     async def _poll_loop(self) -> None:
         while not self._stop.is_set():
             try:
@@ -697,6 +775,8 @@ class Bridge:
                 await self.client.async_connect_ws()
                 await self.client.async_reconcile(self._device_id)
                 await self._publish_state()
+                self._last_poll = datetime.now(timezone.utc)
+                await self._publish_last_poll()
             except AlulaCredentialsRejected:
                 await self._credentials_rejected()
                 await self._stop.wait()
@@ -1237,6 +1317,9 @@ async def main(options_path: str = "/data/options.json") -> int:
             signal.signal(s, lambda *_: bridge.request_stop())
     try:
         await bridge.run()
+    except MqttFatal as err:
+        _LOGGER.error("Alula bridge exiting: %s", err)
+        return 1
     except Exception:  # noqa: BLE001
         # Exit non-zero so the Supervisor watchdog restarts the add-on; the broker
         # has already published our last-will "offline".

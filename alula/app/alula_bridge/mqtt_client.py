@@ -12,6 +12,7 @@ import aiomqtt
 _LOGGER = logging.getLogger(__name__)
 
 MqttError = aiomqtt.MqttError
+MqttCodeError = aiomqtt.MqttCodeError
 
 
 class Mqtt:

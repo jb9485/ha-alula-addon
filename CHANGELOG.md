@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.3.2
+
+MQTT reliability release.
+
+- Startup no longer falls back to an anonymous broker connection when
+  Supervisor hasn't published the MQTT service yet (e.g. Mosquitto still
+  starting after a restore). It waits up to 5 minutes, then exits non-zero so
+  the Supervisor watchdog restarts it.
+- The bridge exits non-zero when the broker rejects its credentials
+  (CONNACK 4/5, MQTT 5 reason 134/135) or after 5 minutes of failed
+  reconnects, so the add-on restarts and re-reads credentials, instead of
+  looping forever while the alarm can't be controlled.
+- New **Last poll** diagnostic sensor (`sensor.alula_alarm_last_poll`, a
+  timestamp with `expire_after`), updated after every successful Alula poll, so
+  stalled polling or a dead link is visible even if a stale retained `online`
+  is on the broker.
+- Docs: turn on the Watchdog, and restart/alert when the alarm entity is
+  unavailable or the last poll is stale.
+
 ## 0.3.1
 
 - Automation disarm moved from the MQTT `alarm/auto_disarm` topic to the Home
